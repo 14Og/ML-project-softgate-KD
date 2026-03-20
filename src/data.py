@@ -82,7 +82,9 @@ def load_20newsgroups(
     train_texts = [clean(t) for t in train_raw.data]
     test_texts = [clean(t) for t in test_raw.data]
 
-    vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=ngram_range)
+    vectorizer = TfidfVectorizer(
+        max_features=max_features, ngram_range=ngram_range, stop_words="english",
+    )
     X_train = vectorizer.fit_transform(train_texts).toarray().astype(np.float32)
     X_test = vectorizer.transform(test_texts).toarray().astype(np.float32)
 
