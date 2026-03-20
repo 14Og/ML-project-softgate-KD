@@ -172,6 +172,16 @@ class KDTrainer(Trainer):
         self.alpha = alpha
         self.temperature = temperature
 
+    def _kd_loss_per_sample(
+        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """KL divergence per sample at temperature T. Shape: (batch,)."""
+        T = self.temperature
+        student_log_probs = F.log_softmax(student_logits / T, dim=1)
+        teacher_probs = F.softmax(teacher_logits / T, dim=1)
+        # sum over classes, keep per-sample
+        return F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=1)
+
     def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
         self.model.train()
         total_loss, correct = 0.0, 0
@@ -185,15 +195,167 @@ class KDTrainer(Trainer):
             with torch.no_grad():
                 teacher_logits = self.teacher(X)
 
-            # Hard-label term
-            ce_loss = self.criterion(student_logits, y)
-
-            # Soft-label term: KL(student || teacher) at temperature T
-            student_log_probs = F.log_softmax(student_logits / T, dim=1)
-            teacher_probs     = F.softmax(teacher_logits / T, dim=1)
-            kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+            ce_loss = F.cross_entropy(student_logits, y)
+            kd_loss = self._kd_loss_per_sample(student_logits, teacher_logits).mean()
 
             loss = (1 - self.alpha) * ce_loss + self.alpha * (T ** 2) * kd_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item() * len(y)
+            correct += (student_logits.argmax(dim=1) == y).sum().item()
+
+        n = len(loader.dataset)
+        return total_loss / n, correct / n
+
+
+class HKDTrainer(KDTrainer):
+    """Hard Gate Knowledge Distillation (Lee et al. 2022).
+
+    Per-sample binary gate based on calibration discrepancy:
+      Δ = p_student(predicted_class) - p_teacher(predicted_class)
+
+    If Δ > 0  → student is overconfident → α=1 → use KD loss (regularize)
+    If Δ ≤ 0  → student is underconfident → α=0 → use CE loss (learn)
+
+    Each sample either gets full teacher supervision or full ground-truth
+    supervision — never a mix.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        teacher: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        temperature: float = 4.0,
+    ):
+        # alpha is unused — the gate replaces it entirely
+        super().__init__(model, teacher, optimizer, device, alpha=0.0, temperature=temperature)
+
+    def _compute_gate(
+        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Binary gate: 1 where student is overconfident, 0 otherwise. Shape: (batch,)."""
+        student_probs = F.softmax(student_logits, dim=1)
+        teacher_probs = F.softmax(teacher_logits, dim=1)
+
+        # Compare confidences on the class the student predicts
+        student_pred = student_logits.argmax(dim=1)
+        p_student = student_probs.max(dim=1).values
+        p_teacher = teacher_probs.gather(1, student_pred.unsqueeze(1)).squeeze(1)
+
+        return (p_student > p_teacher).float()
+
+    def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
+        self.model.train()
+        total_loss, correct = 0.0, 0
+        total_gate_on = 0  # track how often KD is applied
+        T = self.temperature
+
+        for X, y in loader:
+            X, y = X.to(self.device), y.to(self.device)
+
+            student_logits = self.model(X)
+
+            with torch.no_grad():
+                teacher_logits = self.teacher(X)
+
+            gate = self._compute_gate(student_logits, teacher_logits)  # (batch,)
+            total_gate_on += gate.sum().item()
+
+            # Per-sample losses
+            ce_loss = F.cross_entropy(student_logits, y, reduction="none")  # (batch,)
+            kd_loss = self._kd_loss_per_sample(student_logits, teacher_logits)  # (batch,)
+
+            # gate=1 → KD, gate=0 → CE
+            loss = (gate * (T ** 2) * kd_loss + (1 - gate) * ce_loss).mean()
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item() * len(y)
+            correct += (student_logits.argmax(dim=1) == y).sum().item()
+
+        n = len(loader.dataset)
+        return total_loss / n, correct / n
+
+
+class SKDTrainer(KDTrainer):
+    """Soft Gate Knowledge Distillation.
+
+    Extends HKD by replacing the binary gate with a smooth function
+    of the calibration discrepancy:
+        Δ = p_student(predicted_class) - p_teacher(predicted_class)
+
+    Gate functions:
+      - "sigmoid":  α = σ(sharpness · Δ)
+      - "linear":   α = clamp(0.5 + sharpness · Δ,  0, 1)
+
+    When α → 1 (overconfident): more teacher supervision (regularize)
+    When α → 0 (underconfident): more ground-truth supervision (learn)
+
+    As sharpness → ∞, the sigmoid gate converges to the hard gate (HKD).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        teacher: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        temperature: float = 4.0,
+        gate_fn: str = "sigmoid",
+        sharpness: float = 10.0,
+    ):
+        super().__init__(model, teacher, optimizer, device, alpha=0.0, temperature=temperature)
+        self.gate_fn = gate_fn
+        self.sharpness = sharpness
+
+    def _compute_gate(
+        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Smooth gate in [0, 1] based on calibration discrepancy. Shape: (batch,)."""
+        student_probs = F.softmax(student_logits, dim=1)
+        teacher_probs = F.softmax(teacher_logits, dim=1)
+
+        student_pred = student_logits.argmax(dim=1)
+        p_student = student_probs.max(dim=1).values
+        p_teacher = teacher_probs.gather(1, student_pred.unsqueeze(1)).squeeze(1)
+
+        delta = p_student - p_teacher
+
+        if self.gate_fn == "sigmoid":
+            return torch.sigmoid(self.sharpness * delta)
+        elif self.gate_fn == "linear":
+            return torch.clamp(0.5 + self.sharpness * delta, 0.0, 1.0)
+        else:
+            raise ValueError(f"Unknown gate function: {self.gate_fn}")
+
+    def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
+        self.model.train()
+        total_loss, correct = 0.0, 0
+        T = self.temperature
+
+        for X, y in loader:
+            X, y = X.to(self.device), y.to(self.device)
+
+            student_logits = self.model(X)
+
+            with torch.no_grad():
+                teacher_logits = self.teacher(X)
+
+            alpha = self._compute_gate(student_logits, teacher_logits)  # (batch,)
+
+            # Per-sample losses
+            ce_loss = F.cross_entropy(student_logits, y, reduction="none")  # (batch,)
+            kd_loss = self._kd_loss_per_sample(student_logits, teacher_logits)  # (batch,)
+
+            # Smooth mix: each sample gets its own alpha
+            loss = (alpha * (T ** 2) * kd_loss + (1 - alpha) * ce_loss).mean()
 
             self.optimizer.zero_grad()
             loss.backward()
