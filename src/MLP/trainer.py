@@ -348,11 +348,11 @@ class SKDTrainer(KDTrainer):
             with torch.no_grad():
                 teacher_logits = self.teacher(X)
 
-            alpha = self._compute_gate(student_logits, teacher_logits)  # (batch,)
+            alpha = self._compute_gate(student_logits, teacher_logits).detach()
 
             # Per-sample losses
-            ce_loss = F.cross_entropy(student_logits, y, reduction="none")  # (batch,)
-            kd_loss = self._kd_loss_per_sample(student_logits, teacher_logits)  # (batch,)
+            ce_loss = F.cross_entropy(student_logits, y, reduction="none")
+            kd_loss = self._kd_loss_per_sample(student_logits, teacher_logits)
 
             # Smooth mix: each sample gets its own alpha
             loss = (alpha * (T ** 2) * kd_loss + (1 - alpha) * ce_loss).mean()
