@@ -14,6 +14,9 @@ class History:
     train_acc: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
     val_acc: list[float] = field(default_factory=list)
+    # Gate diagnostics (HKD/SKD only): per-epoch mean and std of alpha values
+    gate_mean: list[float] = field(default_factory=list)
+    gate_std: list[float] = field(default_factory=list)
 
     def update(self, tr_loss, tr_acc, va_loss, va_acc):
         self.train_loss.append(tr_loss)
@@ -252,7 +255,7 @@ class HKDTrainer(KDTrainer):
     def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
         self.model.train()
         total_loss, correct = 0.0, 0
-        total_gate_on = 0  # track how often KD is applied
+        all_gate_values = []
         T = self.temperature
 
         for X, y in loader:
@@ -264,7 +267,7 @@ class HKDTrainer(KDTrainer):
                 teacher_logits = self.teacher(X)
 
             gate = self._compute_gate(student_logits, teacher_logits)  # (batch,)
-            total_gate_on += gate.sum().item()
+            all_gate_values.append(gate.detach())
 
             # Per-sample losses
             ce_loss = F.cross_entropy(student_logits, y, reduction="none")  # (batch,)
@@ -279,6 +282,10 @@ class HKDTrainer(KDTrainer):
 
             total_loss += loss.item() * len(y)
             correct += (student_logits.argmax(dim=1) == y).sum().item()
+
+        all_gate = torch.cat(all_gate_values)
+        self.history.gate_mean.append(all_gate.mean().item())
+        self.history.gate_std.append(all_gate.std().item())
 
         n = len(loader.dataset)
         return total_loss / n, correct / n
@@ -338,6 +345,7 @@ class SKDTrainer(KDTrainer):
     def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
         self.model.train()
         total_loss, correct = 0.0, 0
+        all_gate_values = []
         T = self.temperature
 
         for X, y in loader:
@@ -349,6 +357,7 @@ class SKDTrainer(KDTrainer):
                 teacher_logits = self.teacher(X)
 
             alpha = self._compute_gate(student_logits, teacher_logits).detach()
+            all_gate_values.append(alpha)
 
             # Per-sample losses
             ce_loss = F.cross_entropy(student_logits, y, reduction="none")
@@ -363,6 +372,10 @@ class SKDTrainer(KDTrainer):
 
             total_loss += loss.item() * len(y)
             correct += (student_logits.argmax(dim=1) == y).sum().item()
+
+        all_gate = torch.cat(all_gate_values)
+        self.history.gate_mean.append(all_gate.mean().item())
+        self.history.gate_std.append(all_gate.std().item())
 
         n = len(loader.dataset)
         return total_loss / n, correct / n
