@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
@@ -122,8 +123,84 @@ class Trainer:
         n = len(loader.dataset)
         return total_loss / n, correct / n
 
+    @torch.no_grad()
+    def predict(self, loader: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (all_logits, all_labels) for the full loader.
+        Used to compute metrics after training.
+        """
+        self.model.eval()
+        all_logits, all_labels = [], []
+
+        for X, y in loader:
+            X = X.to(self.device)
+            all_logits.append(self.model(X).cpu())
+            all_labels.append(y)
+
+        return torch.cat(all_logits), torch.cat(all_labels)
+
     def save(self, path: str | Path):
         torch.save(self.model.state_dict(), path)
 
     def load(self, path: str | Path):
         self.model.load_state_dict(torch.load(path, map_location=self.device))
+
+
+class KDTrainer(Trainer):
+    """Standard Knowledge Distillation (Hinton et al. 2015).
+
+    Loss = (1 - alpha) * CE(student, hard_labels)
+         + alpha * T^2 * KL(student_soft || teacher_soft)
+
+    The T^2 factor compensates for the 1/T^2 gradient scaling introduced
+    by temperature — without it, the KD term would be effectively shrunk
+    relative to the CE term as T increases.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        teacher: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        alpha: float = 0.5,
+        temperature: float = 4.0,
+    ):
+        # CE loss for the hard-label term
+        super().__init__(model, optimizer, nn.CrossEntropyLoss(), device)
+        self.teacher = teacher.to(device)
+        self.teacher.eval()  # teacher is always frozen
+        self.alpha = alpha
+        self.temperature = temperature
+
+    def _train_epoch(self, loader: DataLoader) -> tuple[float, float]:
+        self.model.train()
+        total_loss, correct = 0.0, 0
+        T = self.temperature
+
+        for X, y in loader:
+            X, y = X.to(self.device), y.to(self.device)
+
+            student_logits = self.model(X)
+
+            with torch.no_grad():
+                teacher_logits = self.teacher(X)
+
+            # Hard-label term
+            ce_loss = self.criterion(student_logits, y)
+
+            # Soft-label term: KL(student || teacher) at temperature T
+            student_log_probs = F.log_softmax(student_logits / T, dim=1)
+            teacher_probs     = F.softmax(teacher_logits / T, dim=1)
+            kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+            loss = (1 - self.alpha) * ce_loss + self.alpha * (T ** 2) * kd_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item() * len(y)
+            correct += (student_logits.argmax(dim=1) == y).sum().item()
+
+        n = len(loader.dataset)
+        return total_loss / n, correct / n
